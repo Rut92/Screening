@@ -140,6 +140,62 @@ def skill_matches(text: str, skills: List[str]) -> Tuple[int, List[str], List[st
             missing.append(sk)
     return len(matched), matched, missing
 
+# ---------- Section parsing & weights ---------- #
+
+SECTION_HEADERS = ["experience", "work history", "employment", "projects", "education", "skills", "summary"]
+
+def split_sections(text: str) -> Dict[str, str]:
+    parts = {"experience": "", "projects": "", "skills": "", "education": "", "summary": "", "other": ""}
+    lines = (text or "").splitlines()
+    current = "other"
+    for line in lines:
+        low = line.lower().strip()
+        matched_header = None
+        for hdr in SECTION_HEADERS:
+            if re.search(rf"\b{re.escape(hdr)}\b", low):
+                matched_header = hdr
+                break
+        if matched_header:
+            current = matched_header if matched_header in parts else "other"
+        parts[current] += line + "\n"
+    return parts
+
+SECTION_WEIGHTS = {
+    "experience": 2.0,
+    "projects": 1.5,
+    "skills": 1.0,
+    "education": 0.5,
+    "summary": 0.8,
+    "other": 1.0,
+}
+
+# ---------- Experience boosting helpers ---------- #
+
+YEARS_PATTERNS = [
+    r"(\d+)\s*\+?\s*(?:years?|yrs?)\s+(?:of\s+)?(?:experience\s+)?(?:in|with)?\s*{skill}",
+    r"{skill}\s+for\s+(\d+)\s*\+?\s*(?:years?|yrs?)",
+    r"{skill}[^.\n]{{0,40}}(\d+)\s*\+?\s*(?:years?|yrs?)",
+    r"(\d+)\s*\+?\s*(?:years?|yrs?)\s+[^.\n]{{0,40}}{skill}",
+]
+
+def count_skill_frequency(text: str, skill: str) -> int:
+    return len(re.findall(rf"(?i)\b{re.escape(skill)}\b", text or ""))
+
+def detect_years_of_experience(text: str, skill: str) -> int:
+    """Return the max years detected near the skill using regex heuristics."""
+    t = text or ""
+    max_years = 0
+    for pat in YEARS_PATTERNS:
+        pat_concrete = pat.format(skill=re.escape(skill))
+        for m in re.finditer(rf"(?i){pat_concrete}", t):
+            try:
+                years = int(m.group(1))
+                if years > max_years:
+                    max_years = years
+            except:
+                continue
+    return max_years
+
 def compute_similarity(job_text: str, resume_text: str, vec: TfidfVectorizer) -> float:
     X = vec.transform([job_text, resume_text])
     sim = cosine_similarity(X[0:1], X[1:2])[0, 0]
@@ -156,8 +212,13 @@ def make_download_link(df: pd.DataFrame, filename: str = "ranked_candidates.csv"
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download results as CSV</a>'
     return href
 
+def make_download_text_link(text: str, filename: str = "candidate_explanations.txt") -> str:
+    b64 = base64.b64encode((text or "").encode()).decode()
+    href = f'<a href="data:file/txt;base64,{b64}" download="{filename}">Download {filename}</a>'
+    return href
+
 def highlight_text(text: str, skills: List[str], color: str = "lightgreen") -> str:
-    text_esc = text
+    text_esc = text or ""
     for sk in skills:
         pattern = re.escape(sk)
         text_esc = re.sub(
@@ -167,12 +228,73 @@ def highlight_text(text: str, skills: List[str], color: str = "lightgreen") -> s
         )
     return text_esc
 
-def recompute_results(jd: str, essential: List[str], desirable: List[str], resumes_raw: Dict[str, str], weights: Dict[str, float]) -> pd.DataFrame:
-    """Recompute ranking table for given data (used after candidate deletion)."""
+# ---------- Explanation helper ---------- #
+
+def build_explanation(
+    candidate: str,
+    row: Dict,
+    resume_text: str,
+    essential: List[str],
+    desirable: List[str],
+    freq_map: Dict[str, int],
+    years_map: Dict[str, int],
+    sections: Dict[str, str]
+) -> str:
+    exp = [f"Candidate: {candidate}"]
+    exp.append(
+        f"Overall Score: {row['Total_Score_%']}% (JD Match {row['JD_Match_%']}%, Essentials {row['Essential_Coverage_%']}%, Desirables {row['Desirable_Coverage_%']}%)"
+    )
+    if row["Matched_Essential"]:
+        exp.append(f"Matched Essential Skills: {row['Matched_Essential']}")
+    if row["Missing_Essential"]:
+        exp.append(f"Missing Essential Skills: {row['Missing_Essential']}")
+    if row["Matched_Desirable"]:
+        exp.append(f"Matched Desirable Skills: {row['Matched_Desirable']}")
+    if row["Missing_Desirable"]:
+        exp.append(f"Missing Desirable Skills: {row['Missing_Desirable']}")
+
+    # Experience boost details
+    boost_bits = []
+    for sk in sorted(freq_map.keys()):
+        parts = [f"{sk}: {freq_map[sk]} mentions"]
+        yrs = years_map.get(sk, 0)
+        if yrs > 0:
+            parts.append(f"{yrs} years")
+        boost_bits.append(" (" .join(parts) + (")" if parts else ""))
+    if boost_bits:
+        exp.append("Experience Evidence: " + "; ".join(boost_bits))
+
+    # Section weighting evidence
+    weighted_hits = []
+    for sec, txt in sections.items():
+        hits = [sk for sk in essential + desirable if re.search(rf"(?i)\b{re.escape(sk)}\b", txt or "")]
+        if hits:
+            weighted_hits.append(f"{sec.title()}({SECTION_WEIGHTS.get(sec, 1.0)}x): {', '.join(hits)}")
+    if weighted_hits:
+        exp.append("Section Weighting Evidence: " + " | ".join(weighted_hits))
+
+    return "\n".join(exp)
+
+# ---------- Recompute (used by delete + saved results rebuild) ---------- #
+
+def recompute_results(
+    jd: str,
+    essential: List[str],
+    desirable: List[str],
+    resumes_raw: Dict[str, str],
+    weights: Dict[str, float]
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Recompute ranking table + explanations for given data (used after candidate deletion).
+    Keeps your original weight normalization behavior and adds:
+      - Experience boosting (frequency + 'X years' detection)
+      - Section weighting
+      - Explanations
+    """
     jd_clean = clean_text(jd)
     resumes_clean = {name: clean_text(txt or "") for name, txt in resumes_raw.items()}
 
-    # Normalize weights to sum 1 (safe-guard)
+    # Normalize weights to sum 1 (same behavior you had in the main view)
     w_jd = float(weights.get("w_jd", 0.5))
     w_ess = float(weights.get("w_ess", 0.4))
     w_des = float(weights.get("w_des", 0.1))
@@ -186,22 +308,53 @@ def recompute_results(jd: str, essential: List[str], desirable: List[str], resum
         return pd.DataFrame(columns=[
             "Candidate","JD_Match_%","Essential_Coverage_%","Desirable_Coverage_%","Total_Score_%",
             "Matched_Essential","Missing_Essential","Matched_Desirable","Missing_Desirable"
-        ])
+        ]), []
 
     corpus = [jd_clean] + [resumes_clean[name] for name in resumes_clean]
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", min_df=1, max_df=0.95)
     vectorizer.fit(corpus)
 
     rows = []
+    explanations = []
+
     for name, rtext_clean in resumes_clean.items():
         sim = compute_similarity(jd_clean, rtext_clean, vectorizer)
+
         ess_count, ess_matched, ess_missing = skill_matches(rtext_clean, essential)
         des_count, des_matched, des_missing = skill_matches(rtext_clean, desirable)
+
         ess_cov = (ess_count / max(1, len(essential))) if essential else 0.0
         des_cov = (des_count / max(1, len(desirable))) if desirable else 0.0
-        score = norm[0] * sim + norm[1] * ess_cov + norm[2] * des_cov
 
-        rows.append({
+        # ---------- Experience Boosting ----------
+        freq_map = {}
+        years_map = {}
+        # count frequencies for all matched skills
+        for sk in ess_matched + des_matched:
+            freq_map[sk] = count_skill_frequency(rtext_clean, sk)
+            years_map[sk] = detect_years_of_experience(resumes_raw.get(name, ""), sk)
+
+        # Frequency boost: 0.01 per mention across all matched skills
+        frequency_boost = 0.01 * sum(freq_map.values())
+
+        # Years boost: 0.02 per year per skill (cap to avoid explosion, e.g., 10 years cap)
+        years_boost = 0.0
+        for sk, yrs in years_map.items():
+            if yrs > 0:
+                years_boost += 0.02 * min(yrs, 10)
+
+        # ---------- Section Weighting ----------
+        sections = split_sections(resumes_raw.get(name, ""))
+        section_score = 0.0
+        for sec, txt in sections.items():
+            hits = [sk for sk in (essential + desirable) if re.search(rf"(?i)\b{re.escape(sk)}\b", txt or "")]
+            if hits:
+                section_score += SECTION_WEIGHTS.get(sec, 1.0) * 0.02 * len(hits)
+
+        # Final score (keeps your normalized primary weights + adds bonuses)
+        score = norm[0] * sim + norm[1] * ess_cov + norm[2] * des_cov + frequency_boost + years_boost + section_score
+
+        row = {
             "Candidate": name,
             "JD_Match_%": to_percent(sim),
             "Essential_Coverage_%": to_percent(ess_cov),
@@ -211,9 +364,16 @@ def recompute_results(jd: str, essential: List[str], desirable: List[str], resum
             "Missing_Essential": ", ".join(ess_missing) if ess_missing else "",
             "Matched_Desirable": ", ".join(des_matched) if des_matched else "",
             "Missing_Desirable": ", ".join(des_missing) if des_missing else "",
-        })
+        }
+        rows.append(row)
+
+        explanation = build_explanation(
+            name, row, resumes_raw.get(name, ""), essential, desirable, freq_map, years_map, sections
+        )
+        explanations.append(explanation)
+
     df = pd.DataFrame(rows).sort_values(by="Total_Score_%", ascending=False).reset_index(drop=True)
-    return df
+    return df, explanations
 
 # ------------------------------- UI ------------------------------------- #
 
@@ -232,7 +392,8 @@ if project_choice == "-- New Project --":
     if new_name and st.sidebar.button("Create Project"):
         project_data = {
             "jd": "", "essential": [], "desirable": [],
-            "resumes": {}, "results": [], "weights": {"w_jd": 0.5, "w_ess": 0.4, "w_des": 0.1}
+            "resumes": {}, "results": [], "explanations": [],
+            "weights": {"w_jd": 0.5, "w_ess": 0.4, "w_des": 0.1}
         }
         save_project(new_name, project_data)
         st.session_state["project"] = new_name
@@ -269,10 +430,10 @@ with st.expander("How it works", expanded=False):
 - Enter the **Job Description**, and list **Essential** and **Desirable** skills.
 - Upload resumes in **PDF, DOCX, or TXT**.
 - The app computes JD match (cosine similarity), essential coverage, and desirable coverage.
-- Final score = weighted sum of the three. Adjust weights in the sidebar.
+- Final score = weighted sum of the three (normalized) **plus** Experience & Section bonuses.
 - You can also view JD/resume text with **highlights** for matched skills.
 - Scanned PDFs are handled using **OCR**.
-- Results are saved with the project for later review.
+- Results (and explanations) are saved with the project for later review.
 - Adding resumes to an existing project will **merge** them with previously saved ones.
 - You can **delete any candidate** or the **entire project** (Danger Zone).
         """
@@ -347,6 +508,14 @@ with tab1:
         vectorizer.fit(corpus)
 
         rows = []
+        explanations = []
+
+        # normalized weights (same as caption)
+        total_w = w_jd + w_ess + w_des
+        if total_w == 0:
+            total_w = 1.0
+        norm = (w_jd / total_w, w_ess / total_w, w_des / total_w)
+
         for name, rtext_clean in resumes_clean.items():
             sim = compute_similarity(jd_clean, rtext_clean, vectorizer)
 
@@ -356,9 +525,30 @@ with tab1:
             ess_cov = (ess_count / max(1, len(essential))) if essential else 0.0
             des_cov = (des_count / max(1, len(desirable))) if desirable else 0.0
 
-            score = norm[0] * sim + norm[1] * ess_cov + norm[2] * des_cov
+            # ---------- Experience Boosting ----------
+            freq_map = {}
+            years_map = {}
+            for sk in ess_matched + des_matched:
+                freq_map[sk] = count_skill_frequency(rtext_clean, sk)
+                years_map[sk] = detect_years_of_experience(resumes_raw.get(name, ""), sk)
 
-            rows.append({
+            frequency_boost = 0.01 * sum(freq_map.values())
+            years_boost = 0.0
+            for sk, yrs in years_map.items():
+                if yrs > 0:
+                    years_boost += 0.02 * min(yrs, 10)
+
+            # ---------- Section Weighting ----------
+            sections = split_sections(resumes_raw.get(name, ""))
+            section_score = 0.0
+            for sec, txt in sections.items():
+                hits = [sk for sk in (essential + desirable) if re.search(rf"(?i)\b{re.escape(sk)}\b", txt or "")]
+                if hits:
+                    section_score += SECTION_WEIGHTS.get(sec, 1.0) * 0.02 * len(hits)
+
+            score = norm[0] * sim + norm[1] * ess_cov + norm[2] * des_cov + frequency_boost + years_boost + section_score
+
+            row = {
                 "Candidate": name,
                 "JD_Match_%": to_percent(sim),
                 "Essential_Coverage_%": to_percent(ess_cov),
@@ -368,7 +558,13 @@ with tab1:
                 "Missing_Essential": ", ".join(ess_missing) if ess_missing else "",
                 "Matched_Desirable": ", ".join(des_matched) if des_matched else "",
                 "Missing_Desirable": ", ".join(des_missing) if des_missing else "",
-            })
+            }
+            rows.append(row)
+
+            explanation = build_explanation(
+                name, row, resumes_raw.get(name, ""), essential, desirable, freq_map, years_map, sections
+            )
+            explanations.append(explanation)
 
         df = pd.DataFrame(rows).sort_values(by="Total_Score_%", ascending=False).reset_index(drop=True)
 
@@ -380,7 +576,13 @@ with tab1:
 
         st.markdown(make_download_link(df), unsafe_allow_html=True)
 
-        # Save project state (merged resumes) + weights
+        # Explanation download (TXT)
+        all_explanations_txt = "\n\n".join(explanations)
+        st.markdown("### 📑 Candidate Explanations")
+        st.text_area("Explanations", all_explanations_txt, height=280)
+        st.markdown(make_download_text_link(all_explanations_txt, "candidate_explanations.txt"), unsafe_allow_html=True)
+
+        # Save project state (merged resumes) + weights + explanations
         if "project" in st.session_state:
             save_project(st.session_state["project"], {
                 "jd": jd,
@@ -388,6 +590,7 @@ with tab1:
                 "desirable": desirable,
                 "resumes": resumes_raw,   # merged
                 "results": df.to_dict(orient="records"),
+                "explanations": explanations,
                 "weights": {"w_jd": w_jd, "w_ess": w_ess, "w_des": w_des}
             })
 
@@ -406,10 +609,11 @@ with tab1:
                     st.markdown("**Missing Desirable:** " + (r["Missing_Desirable"] or "_None_"))
 
                     if st.checkbox(f"Show JD/Resume text with highlights for {r['Candidate']}"):
-                        jd_highlighted = highlight_text(jd, parse_skill_list(essential_raw) + parse_skill_list(desirable_raw), "lightblue")
+                        skills_all = parse_skill_list(essential_raw) + parse_skill_list(desirable_raw)
+                        jd_highlighted = highlight_text(jd, skills_all, "lightblue")
                         resume_highlighted = highlight_text(
                             (resumes_raw.get(r['Candidate']) or ""), 
-                            parse_skill_list(essential_raw) + parse_skill_list(desirable_raw), 
+                            skills_all, 
                             "lightgreen"
                         )
 
@@ -418,6 +622,14 @@ with tab1:
 
                         st.markdown("**Resume with highlights:**", unsafe_allow_html=True)
                         st.markdown(f"<div style='white-space: pre-wrap;'>{resume_highlighted}</div>", unsafe_allow_html=True)
+
+                    # Explanation panel
+                    try:
+                        idx = list(df["Candidate"]).index(r["Candidate"])
+                        st.markdown("**Explanation:**")
+                        st.text_area(f"Explanation for {r['Candidate']}", explanations[idx], height=180, key=f"ex_{r['Candidate']}")
+                    except:
+                        pass
 
 with tab2:
     if "project" in st.session_state:
@@ -433,13 +645,19 @@ with tab2:
                 )
                 st.markdown(make_download_link(df_saved, filename=f"{proj}_results.csv"), unsafe_allow_html=True)
 
-                # show saved weights summary
+                # show saved weights summary (normalized for display)
                 sw = saved.get("weights", {"w_jd": 0.5, "w_ess": 0.4, "w_des": 0.1})
                 total_sw = sw["w_jd"] + sw["w_ess"] + sw["w_des"]
-                if total_sw <= 0: total_sw = 1.0
+                if total_sw <= 0:
+                    total_sw = 1.0
                 st.caption(f"Saved Weights → JD: {sw['w_jd']/total_sw:.2f}, Essential: {sw['w_ess']/total_sw:.2f}, Desirable: {sw['w_des']/total_sw:.2f}")
 
-                # Candidate details with delete button
+                # Download saved explanations
+                saved_expls = saved.get("explanations", [])
+                if saved_expls:
+                    st.markdown(make_download_text_link("\n\n".join(saved_expls), filename=f"{proj}_explanations.txt"), unsafe_allow_html=True)
+
+                # Candidate details with explanation + delete button
                 if show_details:
                     st.markdown("### 🔍 Details by Candidate (Saved)")
                     for r in saved["results"]:
@@ -454,6 +672,27 @@ with tab2:
                             st.markdown("**Matched Desirable:** " + (r['Matched_Desirable'] or "_None_"))
                             st.markdown("**Missing Desirable:** " + (r['Missing_Desirable'] or "_None_"))
 
+                            # Highlights
+                            if st.checkbox(f"Show JD/Resume text with highlights for {r['Candidate']}", key=f"saved_hl_{r['Candidate']}"):
+                                skills_all = saved.get("essential", []) + saved.get("desirable", [])
+                                jd_highlighted = highlight_text(saved.get("jd", ""), skills_all, "lightblue")
+                                resume_text = (saved.get("resumes", {}).get(r["Candidate"]) or "")
+                                resume_highlighted = highlight_text(resume_text, skills_all, "lightgreen")
+                                st.markdown("**Job Description with highlights:**", unsafe_allow_html=True)
+                                st.markdown(f"<div style='white-space: pre-wrap;'>{jd_highlighted}</div>", unsafe_allow_html=True)
+                                st.markdown("**Resume with highlights:**", unsafe_allow_html=True)
+                                st.markdown(f"<div style='white-space: pre-wrap;'>{resume_highlighted}</div>", unsafe_allow_html=True)
+
+                            # Explanation (saved)
+                            try:
+                                idx = list(df_saved["Candidate"]).index(r["Candidate"])
+                                ex_saved = saved_expls[idx] if idx < len(saved_expls) else ""
+                                st.markdown("**Explanation:**")
+                                st.text_area(f"Explanation for {r['Candidate']}", ex_saved, height=180, key=f"saved_ex_{r['Candidate']}")
+                            except:
+                                pass
+
+                            # Delete candidate button
                             col_del1, col_del2 = st.columns([1,4])
                             with col_del1:
                                 if st.button(f"Delete Candidate", key=f"del_{r['Candidate']}"):
@@ -461,8 +700,8 @@ with tab2:
                                     resumes_raw = dict(saved.get("resumes", {}))
                                     if r["Candidate"] in resumes_raw:
                                         resumes_raw.pop(r["Candidate"])
-                                        # Recompute with saved data
-                                        df_new = recompute_results(
+                                        # Recompute with saved data (using same weights)
+                                        df_new, expl_new = recompute_results(
                                             jd=saved.get("jd",""),
                                             essential=saved.get("essential", []),
                                             desirable=saved.get("desirable", []),
@@ -475,6 +714,7 @@ with tab2:
                                             "desirable": saved.get("desirable", []),
                                             "resumes": resumes_raw,
                                             "results": df_new.to_dict(orient="records"),
+                                            "explanations": expl_new,
                                             "weights": saved.get("weights", {"w_jd":0.5,"w_ess":0.4,"w_des":0.1})
                                         })
                                         st.success(f"Candidate '{r['Candidate']}' deleted from project.")
